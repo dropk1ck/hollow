@@ -3,6 +3,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/user.h>
@@ -18,18 +19,34 @@
 #define R_ARG5      r9
 
 #define SYSCALL_STUB_ADDR   0x100000
-#define X64_SYSCALL_BRK     0xcc050f                // syscall; int 3
+#define X64_SYSCALL_BRK     0x9090909090cc050f                // syscall; int 3
+#define SYS_MMAP            9 
 
 unsigned long remote_syscall_addr = 0;
 
+struct map {
+    unsigned long start;
+    unsigned long end;
+    int is_r;
+    int is_w;
+    int is_x;
+};
 
-void parse_addrs(char *buf, unsigned long *start, unsigned long *end) {
+
+void parse_map(char *buf, struct map *map) {
     char *addrs;
+    char *perms;
     char *start_addr, *end_addr;
 
     addrs = strtok(buf, " ");
     if (!addrs) {
         printf("could not parse addresses from maps! line was:\n%s\n", buf);
+        exit(-1);
+    }
+
+    perms = strtok(NULL, " ");
+    if (!perms) {
+        printf("could not parse permissions from maps! line was:\n%s\n", buf);
         exit(-1);
     }
 
@@ -45,15 +62,18 @@ void parse_addrs(char *buf, unsigned long *start, unsigned long *end) {
         exit(-1);
     }
 
-    *start = strtoul(start_addr, NULL, 16);
-    *end = strtoul(end_addr, NULL, 16);
+    map->start = strtoul(start_addr, NULL, 16);
+    map->end = strtoul(end_addr, NULL, 16);
+    if (perms[0] == 'r') { map->is_r = 1; }
+    if (perms[1] == 'w') { map->is_w = 1; }
+    if (perms[2] == 'x') { map->is_x = 1; }
 }
 
 
 void ptrace_peek(pid_t pid, unsigned long addr, unsigned long *out) {
     unsigned long data = ptrace(PTRACE_PEEKDATA, pid, addr, NULL);
     if (data == -1) {
-        perror("ptrace");
+        perror("ptrace peek failed");
         exit(-1);
     }
     *out = data;
@@ -63,14 +83,16 @@ void ptrace_peek(pid_t pid, unsigned long addr, unsigned long *out) {
 void ptrace_poke(pid_t pid, unsigned long addr, unsigned long data) {
     unsigned long status = ptrace(PTRACE_POKEDATA, pid, addr, data);
     if (status == -1) {
-        perror("ptrace");
+        perror("ptrace poke failed");
         exit(-1);
     }
 }
 
+
 void ptrace_peekregs(pid_t pid, struct user_regs_struct *regs) {
+    printf("Peeking at regs...\n");
     if (ptrace(PTRACE_GETREGS, pid, 0, regs) == -1) {
-        perror("ptrace");
+        perror("Failed to peek regs: ptrace");
         exit(-1);
     }
 }
@@ -78,16 +100,18 @@ void ptrace_peekregs(pid_t pid, struct user_regs_struct *regs) {
 
 void ptrace_pokeregs(pid_t pid, struct user_regs_struct *regs) {
     if (ptrace(PTRACE_SETREGS, pid, 0, regs) == -1) {
-        perror("ptrace");
+        perror("Failed to poke regs: ptrace");
         exit(-1);
     }
 }
 
 
-void remote_syscall(pid_t pid, int syscall_id, int arg0, int arg1, int arg2, int arg3, int arg4, int arg5) {
+int remote_syscall(pid_t pid, int syscall_id, int arg0, int arg1, int arg2, int arg3, int arg4, int arg5) {
     struct user_regs_struct saved_regs, work_regs;
+    int status;
     
     // save current register state
+    printf("Saving current register state for pid %d\n", pid);
     ptrace_peekregs(pid, &saved_regs);
 
     // setup arguments for the syscall
@@ -102,24 +126,57 @@ void remote_syscall(pid_t pid, int syscall_id, int arg0, int arg1, int arg2, int
     work_regs.R_ARG5 = arg5;
 
     // set the regs
+    printf("Setting registers for syscall, RIP will be %llx\n", work_regs.R_IP);
     ptrace_pokeregs(pid, &work_regs);
+
+    // run the program until breakpoint
+    printf("Running syscall\n");
+    if (ptrace(PTRACE_CONT, pid, 0, SIGCONT) == -1) {
+        perror("Continuing program failed: ptrace");
+        exit(-1);
+    }
+    waitpid(pid, &status, 0);
+    while (WSTOPSIG(status) == SIGSTOP && ptrace(PTRACE_CONT, pid, 0, SIGCONT) != -1) {
+        waitpid(pid, &status, 0);
+    }
+    if (WSTOPSIG(status) == SIGTRAP) {
+        printf("Hit breakpoint in syscall stub!\n");
+    }
+    else {
+        printf("Program terminated by signal %s\n", strsignal(WTERMSIG(status)));
+    }
+
+    // gets the regs for the return value
+    ptrace_peekregs(pid, &work_regs);
+    printf("RIP after running syscall: %llx\n", work_regs.R_IP);
+    
+    // restore original regs
+    ptrace_pokeregs(pid, &saved_regs);
+
+    // syscall number register holds the return value
+    return work_regs.R_SYSCALL;
 }
 
 
 void setup_remote_syscall(pid_t pid, unsigned long start_addr) {
+    int retval;
+    unsigned long data;
 
-    // 1. write syscall stub to start_addr
+    // write syscall stub to start_addr
+    printf("Writing syscall stub to executable section...\n");
     ptrace_poke(pid, start_addr, (unsigned long)X64_SYSCALL_BRK);
     remote_syscall_addr = start_addr;
 
-    // 2. setup regs for mmap call of address 0x100000 size 0x1000 rwx perms
+    // check what we just did
+    ptrace_peek(pid, start_addr, &data);
+    printf("New data at addr %lx: %lx\n", start_addr, data);
 
-
-    // 3. write syscall stub to 0x100000
-    // 4. win
-    
-
+    // make syscall to map page at SYSCALL_STUB_ADDR
+    printf("Making syscall to map page at %lx\n", (unsigned long)SYSCALL_STUB_ADDR);
+    retval = remote_syscall(pid, SYS_MMAP, SYSCALL_STUB_ADDR, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("SYS_mmap returned %d\n", retval);
 }
+
 
 void child(char *procname, char *argv[]) {
     printf("In child, executing %s\n", procname);
@@ -138,8 +195,8 @@ void parent(pid_t pid, char *progname) {
     waitpid(pid, &status, 0);
     if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
         // modify process
-        printf("This is where we would modify process\n");
-        printf("Enter to continue\n");
+        printf("cat /proc/%d/maps\n", pid);
+        printf("Enter to continue");
         getchar();
 
         // open /proc/[pid]/maps
@@ -152,25 +209,32 @@ void parent(pid_t pid, char *progname) {
         }
 
         // find all mappings that contain the binary path
+        // TODO: this could fail for many reasons (e.g. path was a symlink and real path is different),
+        //       improve someday
         while(fgets(buf, sizeof(buf), vmmap) != NULL) {
             if (strstr(buf, progname) != NULL) {
                 // get the start-end address of the map, and calculate its size
-                unsigned long start, end, size;
+                struct map map;
 
-                // the first time we're here, assume we've found the r-x mapping, and start this nonsense
+                memset(&map, sizeof(map), 0); 
                 printf("found map: %s", buf);
-                parse_addrs(buf, &start, &end);
-                printf("start addr: %lx, end addr: %lx\n", start, end);
+                parse_map(buf, &map);
+                printf("start addr: %lx, end addr: %lx\n", map.start, map.end);
+                if (map.is_r) { printf("map is readable\n"); }
+                if (map.is_w) { printf("map is writeable\n"); }
+                if (map.is_x) { printf("map is executable\n"); }
                 
-                // did we setup the remote syscall functionality yet?
-                if (!did_syscall_setup) {
-                    setup_remote_syscall(pid, start);
+                // did we setup the remote syscall functionality yet? is this an executable section?
+                if ((did_syscall_setup == 0) && map.is_x) {
+                    printf("Doing remote syscall setup...\n");
+                    setup_remote_syscall(pid, map.start);
                     did_syscall_setup = 1;
                 }
 
             }
         }
-
+        printf("About to restart process, Enter to continue....\n");
+        getchar();
         ptrace(PTRACE_CONT, pid, (caddr_t)1, 0);
     }
 }
