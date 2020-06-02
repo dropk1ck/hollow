@@ -200,7 +200,7 @@ void parent(pid_t pid, char *progname) {
         getchar();
 
         // open /proc/[pid]/maps
-        memset(procpath, sizeof(procpath), 0);
+        memset(procpath, 0, sizeof(procpath));
         snprintf(procpath, sizeof(procpath), "/proc/%d/maps", pid);
         vmmap = fopen(procpath, "r");
         if (!vmmap) {
@@ -216,7 +216,7 @@ void parent(pid_t pid, char *progname) {
                 // get the start-end address of the map, and calculate its size
                 struct map map;
 
-                memset(&map, sizeof(map), 0); 
+                memset(&map, 0, sizeof(map)); 
                 printf("found map: %s", buf);
                 parse_map(buf, &map);
                 printf("start addr: %lx, end addr: %lx\n", map.start, map.end);
