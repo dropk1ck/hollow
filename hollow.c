@@ -109,7 +109,8 @@ void ptrace_pokeregs(pid_t pid, struct user_regs_struct *regs) {
 }
 
 
-int remote_syscall(pid_t pid, int syscall_id, int arg0, int arg1, int arg2, int arg3, int arg4, int arg5) {
+int remote_syscall(pid_t pid, int syscall_id, unsigned long arg0, unsigned long arg1, unsigned long arg2, 
+        unsigned long arg3, unsigned long arg4, unsigned long arg5) {
     struct user_regs_struct saved_regs, work_regs;
     int status;
     
@@ -186,7 +187,8 @@ void setup_remote_syscall(pid_t pid, unsigned long start_addr) {
     retval = remote_syscall(pid, SYS_mmap, SYSCALL_STUB_ADDR, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     printf("SYS_mmap returned %d\n", retval);
     if (retval == SYSCALL_STUB_ADDR) {
-        // our mapping worked, put our syscall stub at SYSCALL_STUB_ADDR
+        // our mapping worked, put our syscall stub at SYSCALL_STUB_ADDR and
+        // change to that addr for future syscalls
         ptrace_poke(pid, SYSCALL_STUB_ADDR, (unsigned long)X64_SYSCALL_BRK);
         remote_syscall_addr = SYSCALL_STUB_ADDR;
     }
@@ -239,7 +241,7 @@ void parent(pid_t pid, char *progname) {
 
                 if (did_syscall_setup) {
                     printf("Removing mapping at %lx... ", map.start);
-                    retval = remote_syscall(pid, SYS_munmap, map.start, (map.end-map.start), 0, 0, 0, 0);
+                    retval = remote_syscall(pid, SYS_munmap, map.start, (size_t)(map.end-map.start), 0, 0, 0, 0);
                     if (retval == 0) {
                         printf("success\n");
                     }
