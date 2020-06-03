@@ -20,7 +20,10 @@
 
 #define SYSCALL_STUB_ADDR   0x100000
 #define X64_SYSCALL_BRK     0x9090909090cc050f                // syscall; int 3
-#define SYS_MMAP            9 
+#define SYS_kill            62
+#define SYS_mmap            9
+#define SYS_mprotect        10
+#define SYS_munmap          11
 
 unsigned long remote_syscall_addr = 0;
 
@@ -153,6 +156,13 @@ int remote_syscall(pid_t pid, int syscall_id, int arg0, int arg1, int arg2, int 
     // restore original regs
     ptrace_pokeregs(pid, &saved_regs);
 
+    // send SIGSTOP to the process and resume it to deliver the signal?
+    syscall(SYS_kill, pid, SIGSTOP);
+    if ((ptrace(PTRACE_CONT, pid, 0, 0) == -1) || (waitpid(pid, &status, 0), WSTOPSIG(status) != SIGSTOP)) {
+        printf("Failed to SIGSTOP and restart child\n");
+        exit(-1);
+    }
+
     // syscall number register holds the return value
     return work_regs.R_SYSCALL;
 }
@@ -173,8 +183,13 @@ void setup_remote_syscall(pid_t pid, unsigned long start_addr) {
 
     // make syscall to map page at SYSCALL_STUB_ADDR
     printf("Making syscall to map page at %lx\n", (unsigned long)SYSCALL_STUB_ADDR);
-    retval = remote_syscall(pid, SYS_MMAP, SYSCALL_STUB_ADDR, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    retval = remote_syscall(pid, SYS_mmap, SYSCALL_STUB_ADDR, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     printf("SYS_mmap returned %d\n", retval);
+    if (retval == SYSCALL_STUB_ADDR) {
+        // our mapping worked, put our syscall stub at SYSCALL_STUB_ADDR
+        ptrace_poke(pid, SYSCALL_STUB_ADDR, (unsigned long)X64_SYSCALL_BRK);
+        remote_syscall_addr = SYSCALL_STUB_ADDR;
+    }
 }
 
 
@@ -215,18 +230,27 @@ void parent(pid_t pid, char *progname) {
             if (strstr(buf, progname) != NULL) {
                 // get the start-end address of the map, and calculate its size
                 struct map map;
+                int retval;
 
                 memset(&map, 0, sizeof(map)); 
                 printf("found map: %s", buf);
                 parse_map(buf, &map);
                 printf("start addr: %lx, end addr: %lx\n", map.start, map.end);
-                if (map.is_r) { printf("map is readable\n"); }
-                if (map.is_w) { printf("map is writeable\n"); }
-                if (map.is_x) { printf("map is executable\n"); }
+
+                if (did_syscall_setup) {
+                    printf("Removing mapping at %lx... ", map.start);
+                    retval = remote_syscall(pid, SYS_munmap, map.start, (map.end-map.start), 0, 0, 0, 0);
+                    if (retval == 0) {
+                        printf("success\n");
+                    }
+                    else {
+                        printf("failed!\n");
+                    }
+                }
                 
                 // did we setup the remote syscall functionality yet? is this an executable section?
                 if ((did_syscall_setup == 0) && map.is_x) {
-                    printf("Doing remote syscall setup...\n");
+                    printf("Found executable section, doing remote syscall setup...\n");
                     setup_remote_syscall(pid, map.start);
                     did_syscall_setup = 1;
                 }
