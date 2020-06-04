@@ -99,12 +99,9 @@ void setup_remote_syscall(pid_t pid, unsigned long start_addr) {
 
     // write syscall stub to start_addr
     printf("Writing syscall stub to executable section...\n");
+    ptrace_peek(pid, start_addr, &data);
     ptrace_poke(pid, start_addr, (unsigned long)X64_SYSCALL_BRK);
     remote_syscall_addr = start_addr;
-
-    // check what we just did
-    ptrace_peek(pid, start_addr, &data);
-    printf("New data at addr %lx: %lx\n", start_addr, data);
 
     // make syscall to map page at SYSCALL_STUB_ADDR
     printf("Making syscall to map page at %lx\n", (unsigned long)SYSCALL_STUB_ADDR);
@@ -115,6 +112,8 @@ void setup_remote_syscall(pid_t pid, unsigned long start_addr) {
         // change to that addr for future syscalls
         ptrace_poke(pid, SYSCALL_STUB_ADDR, (unsigned long)X64_SYSCALL_BRK);
         remote_syscall_addr = SYSCALL_STUB_ADDR;
+        // restore original data
+        ptrace_poke(pid, start_addr, data);
     }
 }
 
@@ -128,8 +127,7 @@ void child(char *procname, char *argv[]) {
 
 void parent(pid_t pid, char *progname) {
     int status;
-    int did_syscall_setup = 0;
-    list_node *maps;
+    list_node *maps, *maps_ptr;
     int retval;
 
     waitpid(pid, &status, 0);
@@ -139,32 +137,39 @@ void parent(pid_t pid, char *progname) {
         printf("Enter to continue");
         getchar();
 
-        // find all mappings that contain the binary path
+        // find an executable mapping and setup our remote syscall stub
         maps = parse_maps(pid);
-        for (maps; maps != NULL; maps = maps->next) {
-            struct map *map = maps->data;
-            if (strstr(map->text, progname) != NULL) {
-                printf("start addr: %lx, end addr: %lx\n", map->start, map->end);
-                if (did_syscall_setup) {
-                    printf("Removing mapping at %lx... ", map->start);
-                    retval = remote_syscall(pid, SYS_munmap, map->start, (size_t)(map->end-map->start), 0, 0, 0, 0);
-                    if (retval == 0) {
-                        printf("success\n");
-                    }
-                    else {
-                        printf("failed!\n");
-                    }
-                }
-                
-                // did we setup the remote syscall functionality yet? is this an executable section?
-                if ((did_syscall_setup == 0) && map->is_x) {
-                    printf("Found executable section, doing remote syscall setup...\n");
-                    setup_remote_syscall(pid, map->start);
-                    did_syscall_setup = 1;
-                }
-
+        maps_ptr = maps;
+        for (maps_ptr; maps_ptr != NULL; maps_ptr = maps_ptr->next) {
+            struct map *map = maps_ptr->data;
+            if (map->is_x) {
+                printf("Found executable section, doing remote syscall setup...\n");
+                setup_remote_syscall(pid, map->start);
+                break;
             }
         }
+
+        if (remote_syscall_addr == 0) {
+            printf("Did not find executable section to setup syscall? Impossible\n");
+            exit(-1);
+        }
+
+        printf("Removing all mappings of original program...");
+        maps_ptr = maps;
+        for (maps_ptr; maps_ptr != NULL; maps_ptr = maps_ptr->next) {
+            struct map *map = maps_ptr->data;
+            if (strstr(map->text, progname) != NULL) {
+                printf("  * Removing mapping at %lx... ", map->start);
+                retval = remote_syscall(pid, SYS_munmap, map->start, (size_t)(map->end-map->start), 0, 0, 0, 0);
+                if (retval == 0) {
+                    printf("success\n");
+                }
+                else {
+                    printf("failed!\n");
+                }
+            }
+        }
+
         printf("About to restart process, Enter to continue....\n");
         getchar();
         ptrace(PTRACE_CONT, pid, 1, 0);
